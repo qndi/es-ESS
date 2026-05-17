@@ -1,5 +1,6 @@
 
 from builtins import int
+from collections import deque
 from enum import Enum
 from math import floor
 import os
@@ -29,7 +30,14 @@ class FroniusWattpilot (esESSService):
         self.serviceType = "com.victronenergy.evcharger"
         self.serviceName = self.serviceType + "." + Globals.esEssTagService + "_FroniusWattpilot"
         self.minimumOnOffSeconds = int(self.config["FroniusWattpilot"]["MinOnOffSeconds"])
+
+        # 1→3 phase: minimum continuous seconds of 3-phase demand before actually switching
         self.minimumPhaseSwitchSeconds = int(self.config["FroniusWattpilot"]["MinPhaseSwitchSeconds"])
+        # 3→1 phase: minimum seconds to stay on 3-phase before switching back
+        self.minimumPhaseSwitchSecondsThreeToOne = int(self.config["FroniusWattpilot"]["MinPhaseSwitchSecondsThreeToOne"])
+        # below this SoC (%), switch 3→1 immediately and enforce strict allowance usage
+        self.socProtectionThreshold = int(self.config["FroniusWattpilot"]["SoCProtectionThreshold"])
+
         self.wattpilot = None
         self.allowance = 0
         self.lastPhaseSwitchTime = 0
@@ -39,10 +47,23 @@ class FroniusWattpilot (esESSService):
         self.currentPhaseMode = 1 # will be detected later
         self.mode:VrmEvChargerControlMode = VrmEvChargerControlMode.Manual # will be detected later
         self.autostart = 0
-        self.noChargeSince = 0 #flag to detect, when car is fully charged.
+        self.noChargeSince = 0 # flag to detect when car is fully charged
         self.isIdleMode = False
         self.isHibernateEnabled = self.config["FroniusWattpilot"]["HibernateMode"].lower() == "true"
         self.mqttAllowanceTopic = 'es-ESS/SolarOverheadDistributor/Requests/Wattpilot/Allowance'
+
+        # 1→3 phase: timestamp when 3-phase demand was first observed while on 1-phase (0 = not active)
+        # reset whenever demand drops back to 1-phase — ensures 3-phase only after *sustained* demand
+        self.wantThreePhaseSince = 0
+
+        # 3→1 phase: timestamp of the last entry into 3-phase operation (start of the 1h protection window)
+        self.lastThreeToOneCooldownStart = 0
+
+        # 3→1 phase: rolling history over the last 10 minutes (120 ticks × 5s).
+        # True  = 3-phase still desired that tick
+        # False = 1-phase would suffice
+        # used after the 1h cooldown to decide whether to stay on 3-phase another hour
+        self.phaseCheckHistory: deque = deque(maxlen=120)
 
     def initDbusService(self):
         self.dbusService = VeDbusService(self.serviceName, bus=dbusConnection(), register=False)
@@ -101,7 +122,7 @@ class FroniusWattpilot (esESSService):
         self.dbusService.register()
 
     def initDbusSubscriptions(self):
-        pass
+        self.socDbus = self.registerDbusSubscription("com.victronenergy.system", "/Dc/Battery/Soc")
 
     def initMqttSubscriptions(self):
         self.registerMqttSubscription(self.mqttAllowanceTopic, callback=self.onMqttMessage)
@@ -144,6 +165,9 @@ class FroniusWattpilot (esESSService):
         if (self.wattpilot.carConnected and self.wattpilot.power2 > 0):
             self.currentPhaseMode = 2
             self.publishServiceMessage(self, "Currently charging on 3 phases.")
+            # start the 3→1 protection window from service boot — we don't know
+            # how long 3-phase has been active, so grant a full 1h from now.
+            self.lastThreeToOneCooldownStart = time.time()
         elif (self.wattpilot.carConnected and self.wattpilot.power1 > 0):
             self.currentPhaseMode = 1
             self.publishServiceMessage(self, "Currently charging on 1 phase.")
@@ -345,26 +369,41 @@ class FroniusWattpilot (esESSService):
                                 self.reportVRMStatus(self.adjustChargeCurrent(targetAmps))
                                 
                             else:
-                                #No allowance or low price ended., but still charging. Let's try to stop. 
-                                i(self, "NO Allowance or end of low price phase, stopping charging.")
-                                self.reportVRMStatus(VrmEvChargerStatus.StopCharging) #Stop charging
+                                # Allowance dropped below the 1-phase minimum (voltage1 * 6W).
+                                # Normally we stop charging. Exception: if we are currently on 3-phase,
+                                # the 3→1 protection window is still active, and the battery SoC is
+                                # above the protection threshold — keep charging at the 3-phase minimum
+                                # (6A) instead of stopping. This avoids an unnecessary stop + on/off
+                                # cooldown when solar briefly dips, as long as the battery can handle it.
+                                currentSoc = self.socDbus.value if self.socDbus.value is not None else 0
+                                threeToOneCooldownActive = (time.time() - self.lastThreeToOneCooldownStart) < self.minimumPhaseSwitchSecondsThreeToOne
+                                socAboveThreshold = currentSoc >= self.socProtectionThreshold
 
-                                onOffCooldownSeconds = self.getOnOffCooldownSeconds()
-                                if (onOffCooldownSeconds <= 0):
-                                    #stop charging
-                                    i(self, "STOP send!")
-                                    self.wattpilot.set_start_stop(WattpilotStartStop.Off)
-                                    self.lastOnOffTime = time.time()
-                                    self.dbusService["/StartStop"] = VrmEvChargerStartStop.Stop.value   
-                                    self.dbusService["/StartStopLiteral"] = VrmEvChargerStartStop.Stop.name
-
-                                    #set phases to auto, in case the user takes manual control in the mean time, 
-                                    #or low-price-charging kicks in.
-                                    self.currentPhaseMode = 0
-                                    self.wattpilot.set_phases(0)
+                                if (self.currentPhaseMode == 2 and threeToOneCooldownActive and socAboveThreshold):
+                                    remainingCooldown = round(self.lastThreeToOneCooldownStart + self.minimumPhaseSwitchSecondsThreeToOne - time.time())
+                                    self.publishServiceMessage(self, "Allowance below minimum but holding 3-phase (SoC={0}%, cooldown={1}s remaining). Using 6A.".format(round(currentSoc), remainingCooldown))
+                                    self.wattpilot.set_power(6)
+                                    # 1-phase would suffice → record for post-cooldown history check
+                                    self.phaseCheckHistory.append(False)
+                                    self.reportVRMStatus(VrmEvChargerStatus.Charging)
                                 else:
-                                    self.publishServiceMessage(self, "Stop-Charge delayed due to on/off cooldown: {0}s. Using 6A to reduce impact.".format(onOffCooldownSeconds))
-                                    self.wattpilot.set_power(6) #go for minimum amps, as long as we can't stop. 
+                                    i(self, "NO Allowance or end of low price phase, stopping charging.")
+                                    self.reportVRMStatus(VrmEvChargerStatus.StopCharging)
+
+                                    onOffCooldownSeconds = self.getOnOffCooldownSeconds()
+                                    if (onOffCooldownSeconds <= 0):
+                                        i(self, "STOP send!")
+                                        self.wattpilot.set_start_stop(WattpilotStartStop.Off)
+                                        self.lastOnOffTime = time.time()
+                                        self.dbusService["/StartStop"] = VrmEvChargerStartStop.Stop.value   
+                                        self.dbusService["/StartStopLiteral"] = VrmEvChargerStartStop.Stop.name
+
+                                        # reset to auto-phase so manual control or low-price charging can start cleanly
+                                        self.currentPhaseMode = 0
+                                        self.wattpilot.set_phases(0)
+                                    else:
+                                        self.publishServiceMessage(self, "Stop-Charge delayed due to on/off cooldown: {0}s. Using 6A to reduce impact.".format(onOffCooldownSeconds))
+                                        self.wattpilot.set_power(6)
                         else:
                             #charging, but not in auto mode - so, charging is all that's left to say. 
                             d(self, "Charging in manual mode.")
@@ -527,44 +566,126 @@ class FroniusWattpilot (esESSService):
         return max(0, self.lastPhaseSwitchTime + self.minimumPhaseSwitchSeconds- time.time())
 
     def adjustChargeCurrent(self, targetAmps):
+        # Determine which phase mode the current allowance calls for.
+        # Anything above the single-phase hardware max → needs 3 phases.
         desiredPhaseMode = 2 if targetAmps > self.wattpilot.ampLimit else 1
         enteringPhaseMode = self.currentPhaseMode
 
-        d(self, "Current PhaseMode vs desired Phasemode: {0}/{1}".format(enteringPhaseMode, desiredPhaseMode))
-        
+        currentSoc = self.socDbus.value if self.socDbus.value is not None else 0
+        d(self, "PhaseMode current/desired: {0}/{1}  SoC: {2}%".format(enteringPhaseMode, desiredPhaseMode, round(currentSoc)))
+
         if (self.currentPhaseMode == desiredPhaseMode):
+            # ── No phase change needed ──────────────────────────────────────────
+            # Divide total amps by the number of active phases before sending.
             divider = 1 if self.currentPhaseMode == 1 else 3
             targetAmps = int(round(targetAmps / divider))
-            #Just adjust, no phasemode change required. 
-            i(self, "Adjusting charge current to: {0}A".format(targetAmps))
+            i(self, "Adjusting charge current to: {0}A (phase-mode {1})".format(targetAmps, self.currentPhaseMode))
             self.wattpilot.set_power(targetAmps)
 
-        elif (self.currentPhaseMode != desiredPhaseMode):
-            i(self, "Total amps required is: {0}. Hence switching from phasemode {1} to {2}".format(targetAmps, self.currentPhaseMode, desiredPhaseMode))
-            targetAmps = int(round(targetAmps / desiredPhaseMode))
-            i(self, "That'll be {0}A on PhaseMode {1}".format(targetAmps, desiredPhaseMode))
+            # On 1-phase: any tick where 1-phase is sufficient resets the
+            # 3-phase desire timer — demand must be *continuously* above the
+            # threshold for the full stabilisation window.
+            if self.currentPhaseMode == 1:
+                if self.wantThreePhaseSince != 0:
+                    d(self, "3-phase demand dropped — resetting wantThreePhaseSince.")
+                self.wantThreePhaseSince = 0
 
-            phaseSwitchCooldownSeconds = self.getPhaseSwitchCooldownSeconds()
-            if (phaseSwitchCooldownSeconds <= 0):
-                i(self, "Switching to Phase-Mode: {0}. Send.".format(desiredPhaseMode))
-                self.publishServiceMessage(self, "Switching to Phase-Mode: {0}. Send.".format(desiredPhaseMode))
-                self.lastPhaseSwitchTime = time.time()
-                self.wattpilot.set_phases(desiredPhaseMode)
-                self.currentPhaseMode = desiredPhaseMode
-                self.wattpilot.set_power(targetAmps)
-            else:
-                if (self.currentPhaseMode == 1):
-                    self.publishServiceMessage(self, "Attempted to switch to Phase-Mode {0}, but cooldown is active! Using {1}A on Phase-Mode {2} until cooldown is over in {3}s".format(desiredPhaseMode, self.wattpilot.ampLimit, self.currentPhaseMode, phaseSwitchCooldownSeconds))
+            # On 3-phase: record that 3-phase is still desired for the
+            # post-cooldown history check.
+            if self.currentPhaseMode == 2:
+                self.phaseCheckHistory.append(True)
+
+        else:
+            # ── Phase change required ───────────────────────────────────────────
+            i(self, "Phase change needed: {0}→{1} (total {2}A requested)".format(self.currentPhaseMode, desiredPhaseMode, targetAmps))
+
+            if desiredPhaseMode == 2:
+                # ── 1-Phase → 3-Phase ───────────────────────────────────────────
+                # Only switch after the demand has been *continuously* above the
+                # 3-phase threshold for minimumPhaseSwitchSeconds.  Any tick where
+                # demand drops back to 1-phase resets the timer (see Fall A above).
+                if self.wantThreePhaseSince == 0:
+                    self.wantThreePhaseSince = time.time()
+                    i(self, "3-phase demand started. Waiting {0}s before switching.".format(self.minimumPhaseSwitchSeconds))
+
+                elapsed = time.time() - self.wantThreePhaseSince
+                remaining = self.minimumPhaseSwitchSeconds - elapsed
+
+                if elapsed >= self.minimumPhaseSwitchSeconds:
+                    # Demand has been stable long enough — switch now.
+                    ampsPerPhase = int(round(targetAmps / 3))
+                    self.publishServiceMessage(self, "Switching 1→3-phase after {0}s of stable demand. {1}A/phase.".format(round(elapsed), ampsPerPhase))
+                    self.wattpilot.set_phases(2)
+                    self.currentPhaseMode = 2
+                    self.lastThreeToOneCooldownStart = time.time()
+                    self.phaseCheckHistory.clear()
+                    self.wantThreePhaseSince = 0
+                    self.wattpilot.set_power(ampsPerPhase)
+                else:
+                    # Still in the stabilisation window — hold at 1-phase maximum.
+                    self.publishServiceMessage(self, "1→3-phase pending: {0}s remaining. Holding 1-phase at {1}A.".format(round(remaining), self.wattpilot.ampLimit))
                     self.wattpilot.set_power(self.wattpilot.ampLimit)
-                elif (self.currentPhaseMode == 2):
-                    self.publishServiceMessage(self, "Attempted to switch to Phase-Mode {0}, but cooldown is active! Using 6A on Phase-Mode {1} until cooldown is over in {2}s".format(desiredPhaseMode, self.currentPhaseMode, phaseSwitchCooldownSeconds))
-                    self.wattpilot.set_power(6)       
-        
-        if (desiredPhaseMode == enteringPhaseMode):
+
+            else:
+                # ── 3-Phase → 1-Phase ───────────────────────────────────────────
+                # 3-phase is protected for minimumPhaseSwitchSecondsThreeToOne (default 1h).
+                # After that window, we only switch if 1-phase was desired in ≥80% of
+                # the last 10 minutes — otherwise we extend the protection by another hour.
+                # Exception: if SoC drops below socProtectionThreshold, switch immediately.
+
+                # Record every tick for the post-cooldown decision.
+                self.phaseCheckHistory.append(False)  # 1-phase would suffice this tick
+
+                if currentSoc < self.socProtectionThreshold:
+                    # Battery protection overrides all cooldowns.
+                    ampsPerPhase = int(round(targetAmps))  # targetAmps already for 1-phase
+                    self.publishServiceMessage(self, "SoC {0}% below threshold {1}% — switching 3→1-phase immediately.".format(round(currentSoc), self.socProtectionThreshold))
+                    self.wattpilot.set_phases(1)
+                    self.currentPhaseMode = 1
+                    self.wantThreePhaseSince = 0
+                    self.phaseCheckHistory.clear()
+                    self.wattpilot.set_power(ampsPerPhase)
+
+                else:
+                    # SoC is healthy — apply the 1h protection window.
+                    cooldownElapsed = time.time() - self.lastThreeToOneCooldownStart
+                    remainingCooldown = round(self.minimumPhaseSwitchSecondsThreeToOne - cooldownElapsed)
+
+                    if cooldownElapsed < self.minimumPhaseSwitchSecondsThreeToOne:
+                        # Still inside the protection window.
+                        self.publishServiceMessage(self, "3→1-phase blocked: {0}s remaining in protection window. Using 6A minimum.".format(remainingCooldown))
+                        self.wattpilot.set_power(6)
+                    else:
+                        # Protection window expired — check whether 3-phase was still
+                        # needed for ≥80% of the last 10 minutes.
+                        if len(self.phaseCheckHistory) > 0:
+                            threePhaseRatio = sum(self.phaseCheckHistory) / len(self.phaseCheckHistory)
+                        else:
+                            threePhaseRatio = 0.0
+
+                        if threePhaseRatio >= 0.8:
+                            # 3-phase was still mostly needed — extend the protection window.
+                            self.publishServiceMessage(self, "3-phase desired {0}% of last 10min — extending 3-phase protection by another {1}s.".format(round(threePhaseRatio * 100), self.minimumPhaseSwitchSecondsThreeToOne))
+                            self.lastThreeToOneCooldownStart = time.time()
+                            self.phaseCheckHistory.clear()
+                            self.wattpilot.set_power(6)
+                        else:
+                            # 1-phase was dominant — switch now.
+                            ampsPerPhase = int(round(targetAmps))
+                            self.publishServiceMessage(self, "3-phase desired only {0}% of last 10min — switching 3→1-phase. {1}A.".format(round(threePhaseRatio * 100), ampsPerPhase))
+                            self.wattpilot.set_phases(1)
+                            self.currentPhaseMode = 1
+                            self.wantThreePhaseSince = 0
+                            self.phaseCheckHistory.clear()
+                            self.wattpilot.set_power(ampsPerPhase)
+
+        # Return the VRM status that reflects the phase direction.
+        # If the phase mode did not change this tick, report plain Charging.
+        if desiredPhaseMode == enteringPhaseMode:
             return VrmEvChargerStatus.Charging
-        elif(desiredPhaseMode == 2):
+        elif desiredPhaseMode == 2:
             return VrmEvChargerStatus.SwitchingTo3Phase
-        elif (desiredPhaseMode == 1):
+        else:
             return VrmEvChargerStatus.SwitchingTo1Phase
 
     def dumpEvChargerInfo(self):

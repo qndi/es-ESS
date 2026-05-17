@@ -927,6 +927,7 @@ class SolarOverheadConsumer:
       self.runtimeData.set("Energy","runtimeYesterday",str(self.runtimeYesterday))
       self.runtimeData.set("Energy","runtimeTotal",str(self.runtimeTotal))
 
+      os.makedirs("{0}/runtimeData".format(os.path.dirname(os.path.realpath(__file__))), exist_ok=True)
       with open("{0}/runtimeData/energy_{1}.ini".format(os.path.dirname(os.path.realpath(__file__)), self.consumerKey), 'w+') as cfile:
          t(self, "File open for w+: {0}/runtimeData/energy_{1}.ini".format(os.path.dirname(os.path.realpath(__file__)), self.consumerKey))
          self.runtimeData.write(cfile)
