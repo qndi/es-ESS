@@ -587,10 +587,15 @@ class FroniusWattpilot (esESSService):
         # Determine which phase mode the current allowance calls for.
         # Anything above the single-phase hardware max → needs 3 phases.
         desiredPhaseMode = 2 if targetAmps > self.wattpilot.ampLimit else 1
-        enteringPhaseMode = self.currentPhaseMode
 
         currentSoc = self.socDbus.value if self.socDbus.value is not None else 0
-        d(self, "PhaseMode current/desired: {0}/{1}  SoC: {2}%".format(enteringPhaseMode, desiredPhaseMode, round(currentSoc)))
+        d(self, "PhaseMode current/desired: {0}/{1}  SoC: {2}%".format(self.currentPhaseMode, desiredPhaseMode, round(currentSoc)))
+
+        # Default status — overridden only when a phase switch actually happens
+        # or is actively pending (1→3 stabilisation window).  Protection-window
+        # and cooldown-extension cases intentionally stay at Charging because no
+        # switch is imminent.
+        vrmStatus = VrmEvChargerStatus.Charging
 
         if (self.currentPhaseMode == desiredPhaseMode):
             # ── No phase change needed ──────────────────────────────────────────
@@ -639,10 +644,12 @@ class FroniusWattpilot (esESSService):
                     self.phaseCheckHistory.clear()
                     self.wantThreePhaseSince = 0
                     self.wattpilot.set_power(ampsPerPhase)
+                    vrmStatus = VrmEvChargerStatus.SwitchingTo3Phase
                 else:
                     # Still in the stabilisation window — hold at 1-phase maximum.
                     self.publishServiceMessage(self, "1→3-phase pending: {0}s remaining. Holding 1-phase at {1}A.".format(round(remaining), self.wattpilot.ampLimit))
                     self.wattpilot.set_power(self.wattpilot.ampLimit)
+                    vrmStatus = VrmEvChargerStatus.SwitchingTo3Phase
 
             else:
                 # ── 3-Phase → 1-Phase ───────────────────────────────────────────
@@ -663,6 +670,7 @@ class FroniusWattpilot (esESSService):
                     self.wantThreePhaseSince = 0
                     self.phaseCheckHistory.clear()
                     self.wattpilot.set_power(ampsPerPhase)
+                    vrmStatus = VrmEvChargerStatus.SwitchingTo1Phase
 
                 else:
                     # SoC is healthy — apply the 1h protection window.
@@ -670,9 +678,10 @@ class FroniusWattpilot (esESSService):
                     remainingCooldown = round(self.minimumPhaseSwitchSecondsThreeToOne - cooldownElapsed)
 
                     if cooldownElapsed < self.minimumPhaseSwitchSecondsThreeToOne:
-                        # Still inside the protection window.
+                        # Still inside the protection window — no switch imminent.
                         self.publishServiceMessage(self, "3→1-phase blocked: {0}s remaining in protection window. Using 6A minimum.".format(remainingCooldown))
                         self.wattpilot.set_power(6)
+                        # vrmStatus stays Charging
                     else:
                         # Protection window expired — check whether 3-phase was still
                         # needed for ≥80% of the last 10 minutes.
@@ -687,6 +696,7 @@ class FroniusWattpilot (esESSService):
                             self.lastThreeToOneCooldownStart = time.time()
                             self.phaseCheckHistory.clear()
                             self.wattpilot.set_power(6)
+                            # vrmStatus stays Charging
                         else:
                             # 1-phase was dominant — switch now.
                             ampsPerPhase = int(round(targetAmps))
@@ -696,15 +706,9 @@ class FroniusWattpilot (esESSService):
                             self.wantThreePhaseSince = 0
                             self.phaseCheckHistory.clear()
                             self.wattpilot.set_power(ampsPerPhase)
+                            vrmStatus = VrmEvChargerStatus.SwitchingTo1Phase
 
-        # Return the VRM status that reflects the phase direction.
-        # If the phase mode did not change this tick, report plain Charging.
-        if desiredPhaseMode == enteringPhaseMode:
-            return VrmEvChargerStatus.Charging
-        elif desiredPhaseMode == 2:
-            return VrmEvChargerStatus.SwitchingTo3Phase
-        else:
-            return VrmEvChargerStatus.SwitchingTo1Phase
+        return vrmStatus
 
     def dumpEvChargerInfo(self):
         #method is called, whenever new information arrive through mqtt. 
