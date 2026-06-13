@@ -279,6 +279,25 @@ class FroniusWattpilot (esESSService):
                             if (Helper.waitTimeout(lambda: self.wattpilot.carStateReady, 30)):
                                 if (self.wattpilot.carConnected):
                                     self.publishServiceMessage(self, "Car connected. Entering operation mode.")
+                                    # Explicitly leave idle mode — do not rely on the next tick,
+                                    # because the Wattpilot device may disconnect before that tick
+                                    # runs (device-side session timeout), which would leave
+                                    # isIdleMode=True despite a connected car.
+                                    self.isIdleMode = False
+                                else:
+                                    # carStateReady but no car — go back to hibernate/idle
+                                    self.publishServiceMessage(self, "Wakeup check: no car found. Going back to idle.")
+                                    self.isIdleMode = True
+                                    if (self.isHibernateEnabled):
+                                        self.wattpilot._auto_reconnect = False
+                                        self.wattpilot.disconnect()
+                            else:
+                                # carStateReady timed out — go back to hibernate/idle
+                                self.publishServiceMessage(self, "Wakeup check timed out. Going back to idle.")
+                                self.isIdleMode = True
+                                if (self.isHibernateEnabled):
+                                    self.wattpilot._auto_reconnect = False
+                                    self.wattpilot.disconnect()
 
                         
                     if (not skipIdleCheck):                    
@@ -359,8 +378,8 @@ class FroniusWattpilot (esESSService):
                         self.publishRetained("/LastChargeModeLiteral", "SolarOverhead")
                         if (self.wattpilot.mode == WattpilotControlMode.ECO):
                             #Mode auto + charging reported. => We are in duty of contorl!
-                            if self.allowance >= self.wattpilot.voltage1 * 6:
-                                targetAmps = int(round(max(self.allowance / self.wattpilot.voltage1, 6))) 
+                            if self.allowance >= int(round(self.wattpilot.voltage1 * 6)):
+                                targetAmps = round(max(self.allowance / self.wattpilot.voltage1, 6)) 
                                 targetAmps = min(self.wattpilot.ampLimit * 3, targetAmps) #obey limits.
 
                                 self.publishServiceMessage(self, "Current allowance is {0}W, that's {1}A".format(self.allowance, targetAmps))
@@ -379,9 +398,8 @@ class FroniusWattpilot (esESSService):
                                 threeToOneCooldownActive = (time.time() - self.lastThreeToOneCooldownStart) < self.minimumPhaseSwitchSecondsThreeToOne
                                 socAboveThreshold = currentSoc >= self.socProtectionThreshold
 
-                                if (self.currentPhaseMode == 2 and threeToOneCooldownActive and socAboveThreshold):
-                                    remainingCooldown = round(self.lastThreeToOneCooldownStart + self.minimumPhaseSwitchSecondsThreeToOne - time.time())
-                                    self.publishServiceMessage(self, "Allowance below minimum but holding 3-phase (SoC={0}%, cooldown={1}s remaining). Using 6A.".format(round(currentSoc), remainingCooldown))
+                                if (self.currentPhaseMode == 2 and socAboveThreshold):
+                                    self.publishServiceMessage(self, "Allowance below minimum but holding 3-phase (SoC={0}%). Using 6A.".format(round(currentSoc)))
                                     self.wattpilot.set_power(6)
                                     # 1-phase would suffice → record for post-cooldown history check
                                     self.phaseCheckHistory.append(False)
@@ -417,7 +435,7 @@ class FroniusWattpilot (esESSService):
                     if (self.wattpilot.mode == WattpilotControlMode.ECO):
                         #auto
                         #check allowance
-                        if (self.allowance >= self.wattpilot.voltage1 * 6):
+                        if (self.allowance >= int(round(self.wattpilot.voltage1 * 6))):
                             onOffCooldownSeconds = self.getOnOffCooldownSeconds()
 
                             self.reportVRMStatus(VrmEvChargerStatus.StartCharging) #start charging
@@ -426,7 +444,7 @@ class FroniusWattpilot (esESSService):
                                 self.publishServiceMessage(self, "Starting to charge.")
 
                                 #check, if we need to start in 1 or 3 phase mode, based on targetAmps. 
-                                targetAmps = int(round(max(self.allowance / self.wattpilot.voltage1, 6))) 
+                                targetAmps = round(max(self.allowance / self.wattpilot.voltage1, 6)) 
                                 targetAmps = min(self.wattpilot.ampLimit * 3, targetAmps) #obey limits.
 
                                 if (targetAmps > self.wattpilot.ampLimit):
